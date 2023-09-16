@@ -1,0 +1,2 @@
+MAX_LEN = 128
+DROPOUT = 0.1

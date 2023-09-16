@@ -21,6 +21,10 @@
 
 ## Utilities
 - __Entity__: Entity Recognitition from Text Documents.
+    - __Experimental__:
+        1. Compute loss for all Entitities
+        2. Mask all `OBJECT` terms and compute loss
+        
 ```
 .
 ├── config.py

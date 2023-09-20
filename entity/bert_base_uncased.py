@@ -6,16 +6,15 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import wandb
 from torch.cuda import amp
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, BertModel
+from transformers import BertTokenizerFast, BertModel
 import pandas as pd
 
-from entity import config as cfg
-from entity.dataset import EntityRecognitionDataset
+import config as cfg
+from dataset import EntityRecognitionDataset
 
 
 # Output Data Class
@@ -57,7 +56,7 @@ class BertEntityModel(nn.Module):
         labels = torch.where(
             attention_mask == 1,
             labels,
-            torch.tensor(loss_fct.ignore_index, dytpe=labels.dtype),
+            torch.tensor(loss_fct.ignore_index, dtype=labels.dtype, device=cfg.DEVICE),
         )
         loss = loss_fct.forward(input=logits, target=labels)
         return loss
@@ -68,7 +67,7 @@ class BertEntityModel(nn.Module):
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         return_dict: Optional[bool] = True,
-    ) -> Any[Dict[str, torch.Tensor], BertEntityModelOutput]:
+    ):
         outputs = self.bert.forward(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.last_hidden_state  # [BATCH_SIZE, SEQ_LEN, 768]
         logits = self.ffwd.forward(logits)  # [BATCH_SIZE, SEQ_LEN, NUM_TAGS]
@@ -117,29 +116,21 @@ def train_one_epoch(
         batch_size = batch["input_ids"].shape[0]
         running_loss += loss.item() * batch_size
         dataset_size += batch_size
-        running_hits += torch.sum(
-            (
-                torch.argmax(logits.view(-1, model.num_tags), dim=-1)
-                == batch["labels"].view(-1)
-            ).to(dtype=torch.float)
-        )
 
         epoch_loss = running_loss / dataset_size
-        epoch_accuracy = (running_hits / dataset_size) * 100
 
         pbar.set_postfix(
-            {"loss": f"{epoch_loss:.4f}", "accuracy": f"{epoch_accuracy:.4f}"}
+            {"loss": f"{epoch_loss:.4f}"}
         )
 
         wandb.log(
             {
                 "step": step,
                 f"train/epoch_loss/epoch={epoch}": epoch_loss,
-                f"train/epoch_accuracy/epoch={epoch}": epoch_accuracy,
             }
         )
 
-    return epoch_accuracy, epoch_loss
+    return epoch_loss
 
 
 # Valid One Epoch
@@ -163,29 +154,21 @@ def valid_one_epoch(
         batch_size = batch["input_ids"].shape[0]
         running_loss += loss.item() * batch_size
         dataset_size += batch_size
-        running_hits += torch.sum(
-            (
-                torch.argmax(logits.view(-1, model.num_tags), dim=-1)
-                == batch["labels"].view(-1)
-            ).to(dtype=torch.float)
-        )
 
         epoch_loss = running_loss / dataset_size
-        epoch_accuracy = (running_hits / dataset_size) * 100
 
         pbar.set_postfix(
-            {"loss": f"{epoch_loss:.4f}", "accuracy": f"{epoch_accuracy:.4f}"}
+            {"loss": f"{epoch_loss:.4f}"}
         )
 
         wandb.log(
             {
                 "step": step,
                 f"valid/epoch_loss/epoch={epoch}": epoch_loss,
-                f"valid/epoch_accuracy/epoch={epoch}": epoch_accuracy,
             }
         )
 
-    return epoch_accuracy, epoch_loss
+    return epoch_loss
 
 
 # Main Logic for training
@@ -219,7 +202,7 @@ def run_training(train_dataloader: DataLoader, valid_dataloader: DataLoader):
         print("*" * 15)
 
         scaler = amp.grad_scaler.GradScaler()
-        train_accuracy, train_loss = train_one_epoch(
+        train_loss = train_one_epoch(
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -228,7 +211,7 @@ def run_training(train_dataloader: DataLoader, valid_dataloader: DataLoader):
             epoch=epoch,
         )
 
-        valid_accuracy, valid_loss = valid_one_epoch(
+        valid_loss = valid_one_epoch(
             model=model,
             dataloader=valid_dataloader,
             epoch=epoch,
@@ -244,16 +227,12 @@ def run_training(train_dataloader: DataLoader, valid_dataloader: DataLoader):
 
             run.summary["BEST_TRAIN_LOSS"] = train_loss
             run.summary["BEST_VALID_LOSS"] = valid_loss
-            run.summary["BEST_TRAIN_ACCURACY"] = train_accuracy
-            run.summary["BEST_VALID_ACCURACY"] = valid_accuracy
 
         wandb.log(
             {
                 "epoch": epoch,
                 "train/loss": train_loss,
-                "train/accuracy": train_accuracy,
                 "valid/loss": valid_loss,
-                "valid/accuracy": valid_accuracy,
             }
         )
 
@@ -261,8 +240,8 @@ def run_training(train_dataloader: DataLoader, valid_dataloader: DataLoader):
 
 
 if __name__ == "__main__":
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    df = pd.read_csv("../../data/ner/ner_train.csv")
+    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+    df = pd.read_csv("../data/ner/ner_train.csv")
 
     train_df, valid_df = df[:180035], df[180035:]
     train_dataset, valid_dataset = EntityRecognitionDataset(

@@ -48,8 +48,3 @@ class EntityRecognitionDataset(Dataset):
             "labels": torch.tensor(labels, dtype=torch.long),  # (BATCH_SIZE, SEQ_LEN)
         }
 
-
-# Collate Function
-def collate_fn(inputs):
-    # TODO: Add Collate Function Logic...
-    pass

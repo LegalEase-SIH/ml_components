@@ -1,254 +1,301 @@
 import copy
-import logging
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+import einops
+import joblib
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
+from sklearn import model_selection, preprocessing
 from torch.cuda import amp
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import BertTokenizerFast, BertModel
-import pandas as pd
-
-import config as cfg
-from dataset import EntityRecognitionDataset
+from transformers import BertModel, BertTokenizerFast
+from transformers import get_linear_schedule_with_warmup
 
 
-# Output Data Class
-@dataclass
-class BertEntityModelOutput:
-    logits: torch.Tensor
-    loss: Optional[torch.Tensor]
+# ---------------------------------- Config ---------------------------------- #
+class cfg:
+    batch_size: int = 16
+    max_len: int = 128
+    dropout: float = 0.1
+    epochs: int = 10
+    learning_rate: float = 3e-4
+    hidden_size: int = 384
+    entities: List[str] = [
+        "WITNESS",
+        "OTHER_PERSON",
+        "STATUTE",
+        "CASE_NUMBER",
+        "GPE",
+        "ORG",
+        "DATE",
+        "JUDGE",
+        "PROVISION",
+        "PETITIONER",
+        "RESPONDENT",
+        "COURT",
+        "PRECEDENT",
+    ]
+    num_tags: int = len(entities)
+    model_path: str = "bert-base-uncased"
+    tokenizer: BertTokenizerFast = BertTokenizerFast.from_pretrained(
+        model_path)
+    device: torch.device = torch.device(
+        "cuda" if torch.has_cuda else "mps" if torch.has_mps else "cpu")
 
 
-# Bert Entity Model
-class BertEntityModel(nn.Module):
-    def __init__(self, hidden_size: int, num_tags: int) -> None:
+# ---------------------------------- Dataset --------------------------------- #
+class LegalEntityDataset(Dataset):
+    def __init__(self, texts: List[List[str]], tags: List[List[str]]) -> None:
         super().__init__()
-        self.bert = BertModel.from_pretrained("bert-base-uncased")
-        self.dropout = nn.Dropout(p=cfg.DROPOUT)
+        self.texts = texts
+        self.tags = tags
+
+    def __len__(self) -> int:
+        return len(self.texts)
+
+    def __getitem__(self, ix: int) -> Dict[str, torch.Tensor]:
+        text = self.texts[ix]
+        tags = self.tags[ix]
+
+        input_ids = []
+        target_ids = []
+
+        for i, s in enumerate(text):
+            inputs = cfg.tokenizer.encode(text=s, add_special_tokens=False)
+            input_ids.extend(inputs)
+            target_ids.extend([tags[i]*len(inputs)])
+
+        input_ids = input_ids[:cfg.max_len - 2]
+        target_ids = target_ids[:cfg.max_len - 2]
+
+        input_ids = [101] + input_ids + [102]
+        target_ids = [0] + target_ids + [0]
+
+        attention_mask = [1] * len(input_ids)
+        token_type_ids = [1] * len(input_ids)
+
+        padding_len = cfg.max_len - len(input_ids)
+
+        input_ids = input_ids + ([0]*padding_len)
+        attention_mask = attention_mask + ([0]*padding_len)
+        token_type_ids = token_type_ids + ([0]*padding_len)
+        target_ids = target_ids + ([0]*padding_len)
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
+            "labels": torch.tensor(target_ids, dtype=torch.long)
+        }
+
+
+# ----------------------------------- Model ---------------------------------- #
+class EntityModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.distilbert = BertModel.from_pretrained(cfg.model_path)
+        self.dropout = nn.Dropout(p=cfg.dropout)
         self.ffwd = nn.Sequential(
-            nn.Linear(
-                in_features=self.bert.config.hidden_size, out_features=hidden_size
-            ),
-            nn.GELU(),
-            nn.Linear(in_features=hidden_size, out_features=num_tags),
+            nn.Linear(in_features=768, out_features=cfg.hidden_size, bias=True),
+            nn.SELU(),
+            nn.Linear(in_features=cfg.hidden_size,
+                      out_features=cfg.num_tags, bias=False)
         )
-        self.num_tags = num_tags
-        self.loss_fct = nn.CrossEntropyLoss()
 
     @staticmethod
-    def _compute_loss(
-        logits: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,
-        num_tags: int,
-        loss_fct: nn.CrossEntropyLoss,
-    ) -> torch.Tensor:
-        loss = None
-        logits = logits.view(-1, num_tags)  # [BATCH_SIZE * SEQ_LEN, NUM_TAGS]
-        labels = labels.view(-1)  # [BATCH_SIZE * SEQ_LEN]
-        attention_mask = attention_mask.view(-1)  # [BATCH_SIZE * SEQ_LEN]
-        # mask the padding tokens with -100 to ignore when computing it.
+    def _compute_loss(logits: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        '''
+        b - batch size
+        s - sequence length
+        c - num classes
+        '''
+        loss_fct = nn.CrossEntropyLoss()
+        attention_mask = einops.rearrange(
+            tensor=attention_mask, pattern='b s -> (b s)')
+        logits = einops.rearrange(tensor=logits, pattern='b s c -> (b s) c')
+        labels = einops.rearrange(tensor=labels, pattern='b s -> (b s)')
         labels = torch.where(
             attention_mask == 1,
             labels,
-            torch.tensor(loss_fct.ignore_index, dtype=labels.dtype, device=cfg.DEVICE),
+            torch.tensor(loss_fct.ignore_index,
+                         dtype=labels.dtype, device=logits.device)
         )
-        loss = loss_fct.forward(input=logits, target=labels)
+        loss = loss_fct(logits, labels)
         return loss
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
-        return_dict: Optional[bool] = True,
-    ):
-        outputs = self.bert.forward(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.last_hidden_state  # [BATCH_SIZE, SEQ_LEN, 768]
-        logits = self.ffwd.forward(logits)  # [BATCH_SIZE, SEQ_LEN, NUM_TAGS]
+        token_type_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor]:
+        out, _ = self.distilbert.forward(
+            input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
+        logits = self.dropout(out)
+        logits = self.ffwd(logits)
 
         loss = None
-        if logits is not None:
+        if labels is not None:
             loss = self._compute_loss(
                 logits=logits,
-                labels=labels,
-                num_tags=self.num_tags,
-                loss_fct=self.loss_fct,
                 attention_mask=attention_mask,
+                labels=labels
             )
 
-        if return_dict:
-            return {"logits": logits, "loss": loss}
-
-        return BertEntityModelOutput(logits=logits, loss=loss)
+        return logits, loss
 
 
-# Train One Epoch
-def train_one_epoch(
-    model: BertEntityModel,
-    optimizer: torch.optim,
-    scheduler: torch.optim.lr_scheduler,
-    dataloader: DataLoader,
-    scaler: amp.grad_scaler.GradScaler,
-    epoch: int,
-) -> Tuple[float, float]:
-    pbar = tqdm(enumerate(dataloader), desc="train ", total=len(dataloader))
-    running_loss, dataset_size, running_hits = 0, 0, 0
+# ------------------------------ Train Function ------------------------------ #
+def train_fn(model, optimizer, scheduler, dataloader, scaler, epoch) -> float:
+    model.train()
+    running_loss, dataset_size = 0, 0
+    pbar = tqdm(enumerate(dataloader), desc='(train) ', total=len(dataloader))
 
-    for step, batch in pbar:
-        batch = {k: v.to(cfg.DEVICE) for k, v in batch.items()}
-
-        with amp.autocast_mode.autocast():
-            outputs = model.forward(**batch)
-            logits, loss = outputs["logits"], outputs["loss"]
-            del outputs
+    for _, batch in pbar:
+        batch = {k: v.to(cfg.device) for k, v in batch.items()}
+        with amp.autocast():
+            _, loss = model.forward(**batch)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer=optimizer)
+        scaler.update()
         if scheduler is not None:
             scheduler.step()
 
-        batch_size = batch["input_ids"].shape[0]
-        running_loss += loss.item() * batch_size
-        dataset_size += batch_size
+        running_loss += (loss.item()*batch['input_ids'].shape[0])
+        dataset_size += batch['input_ids'].shape[0]
 
         epoch_loss = running_loss / dataset_size
+        pbar.set_postfix({'loss': f'{loss:.4f}'})
 
-        pbar.set_postfix(
-            {"loss": f"{epoch_loss:.4f}"}
-        )
-
-        wandb.log(
-            {
-                "step": step,
-                f"train/epoch_loss/epoch={epoch}": epoch_loss,
-            }
-        )
+        wandb.log({f'train/epoch_loss/epoch={epoch}': epoch_loss})
 
     return epoch_loss
 
 
-# Valid One Epoch
+# ---------------------------- Validation Function --------------------------- #
 @torch.no_grad()
-def valid_one_epoch(
-    model: BertEntityModel,
-    dataloader: DataLoader,
-    epoch: int,
-) -> Tuple[float, float]:
-    pbar = tqdm(enumerate(dataloader), desc="valid ", total=len(dataloader))
-    running_loss, dataset_size, running_hits = 0, 0, 0
+def valid_fn(model, dataloader):
+    model.eval()
+    running_loss, dataset_size = 0, 0
+    pbar = tqdm(enumerate(dataloader), desc='(valid) ', total=len(dataloader))
 
-    for step, batch in pbar:
-        batch = {k: v.to(cfg.DEVICE) for k, v in batch.items()}
+    for _, batch in pbar:
+        batch = {k: v.to(cfg.device) for k, v in batch.items()}
+        with amp.autocast():
+            _, loss = model.forward(**batch)
 
-        with amp.autocast_mode.autocast():
-            outputs = model.forward(**batch)
-            logits, loss = outputs["logits"], outputs["loss"]
-            del outputs
-
-        batch_size = batch["input_ids"].shape[0]
-        running_loss += loss.item() * batch_size
-        dataset_size += batch_size
+        running_loss += (loss.item()*batch['input_ids'].shape[0])
+        dataset_size += batch['input_ids'].shape[0]
 
         epoch_loss = running_loss / dataset_size
+        pbar.set_postfix({'loss': f'{loss:.4f}'})
 
-        pbar.set_postfix(
-            {"loss": f"{epoch_loss:.4f}"}
-        )
-
-        wandb.log(
-            {
-                "step": step,
-                f"valid/epoch_loss/epoch={epoch}": epoch_loss,
-            }
-        )
+        wandb.log({f'valid/epoch_loss/epoch={epoch}': epoch_loss})
 
     return epoch_loss
 
 
-# Main Logic for training
-def run_training(train_dataloader: DataLoader, valid_dataloader: DataLoader):
-    run = wandb.init(
-        project="legalease",
-        notes="experiments for entity recognition from legal documents",
-        tags=["nlp", "sih"],
-        config={
-            "epochs": cfg.EPOCHS,
-            "learning_rate": cfg.LEARNING_RATE,
-            "batch_size": cfg.BATCH_SIZE,
-            "model": "Bert",
-        },
-        group=f"entity-extraction",
-    )
+# --------------------------- Process Data Function -------------------------- #
+def process_data(data_file):
+    df = pd.read_csv(data_file)
 
-    model = BertEntityModel(hidden_size=cfg.HIDDEN_SIZE, num_tags=cfg.NUM_TAGS).to(
-        cfg.DEVICE
-    )
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=cfg.LEARNING_RATE)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer=optimizer, T_max=30_000, eta_min=1e-5
-    )
-    best_model_wts = copy.deepcopy(model.state_dict())
+    encoder = preprocessing.LabelEncoder()
+
+    df.loc[:, "tag"] = encoder.fit_transform(df["tag"])
+
+    sentences = df.groupby("sentence #")["words"].apply(list).values
+    tags = df.groupby("sentence #")['tag'].apply(list).values
+
+    return sentences, tags, encoder
+
+
+if __name__ == '__main__':
+    sentences, tags, encoder = process_data('../data/ner/ner_train.csv')
+
+    joblib.dump(encoder, "encoder.bin")
+
+    num_tags = len(list(encoder.classes_))
+
+    # build dataset
+    (train_sentences, test_sentences, train_tags, test_tags) = model_selection.train_test_split(
+        sentences, tags, random_state=42, test_size=0.2)
+
+    train_dataset = LegalEntityDataset(texts=train_sentences, tags=train_tags)
+    train_loader = DataLoader(
+        dataset=train_dataset, shuffle=True, batch_size=cfg.batch_size, num_workers=4)
+
+    valid_dataset = LegalEntityDataset(texts=test_sentences, tags=test_tags)
+    valid_loader = DataLoader(
+        dataset=valid_dataset, shuffle=True, batch_size=cfg.batch_size, num_workers=4)
+
+    # define the model
+    model = EntityModel()
+
+    # build the optimizer
+    no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+    param_optimizer = list(model.named_parameters())
+
+    optimizer_parameters = [
+        {
+            "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+            "weight_decay": 0.001
+        },
+        {
+            "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0
+        }
+    ]
+
+    num_training_steps = int(len(train_sentences) /
+                             cfg.batch_size * cfg.epochs)
+    optimizer = torch.optim.AdamW(optimizer_parameters, lr=3e-4)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
+
     best_loss = np.infty
 
-    for epoch in range(cfg.EPOCHS):
-        print("*" * 15)
-        print(f"*** Epoch {epoch+1} ***")
-        print("*" * 15)
+    run = wandb.init(
+        project='legalease',
+        notes="experiments for entity recognition from legal documents",
+        tags=['sih', 'tags'],
+        config={
+            'epochs': cfg.epochs,
+            'learning_rate': cfg.learning_rate,
+            'batch_size': cfg.batch_size,
+            'model': cfg.model_path,
+            'hidden_size': cfg.hidden_size
+        }
+    )
 
-        scaler = amp.grad_scaler.GradScaler()
-        train_loss = train_one_epoch(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            dataloader=train_dataloader,
-            scaler=scaler,
-            epoch=epoch,
-        )
+    for epoch in range(cfg.epochs):
+        print('-'*20)
+        print(f'*** Epoch [{epoch+1}/{cfg.epochs}]')
+        print('-'*20)
 
-        valid_loss = valid_one_epoch(
-            model=model,
-            dataloader=valid_dataloader,
-            epoch=epoch,
-        )
+        train_loss = train_fn(model=model, optimizer=optimizer,
+                              scheduler=scheduler, dataloader=train_loader)
+        valid_loss = valid_fn(model=model, dataloader=valid_loader)
 
         if valid_loss < best_loss:
-            print(f"Loss improved from {best_loss} to {valid_loss}...")
+            print(
+                f'Best loss decreased from {best_loss:.4f} to {valid_loss:.4f}')
             best_loss = valid_loss
-            best_model_wts = copy.deepcopy(model.state_dict())
-
-            torch.save(best_model_wts, f"../../models/best_model_ner.pth")
-            print(f"Best model checkpoints stored...")
-
-            run.summary["BEST_TRAIN_LOSS"] = train_loss
-            run.summary["BEST_VALID_LOSS"] = valid_loss
-
-        wandb.log(
-            {
-                "epoch": epoch,
-                "train/loss": train_loss,
-                "valid/loss": valid_loss,
-            }
-        )
-
-    return model.load_state_dict(best_model_wts)
-
-
-if __name__ == "__main__":
-    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
-    df = pd.read_csv("../data/ner/ner_train.csv")
-
-    train_df, valid_df = df[:180035], df[180035:]
-    train_dataset, valid_dataset = EntityRecognitionDataset(
-        df=train_df, tokenizer=tokenizer
-    ), EntityRecognitionDataset(df=valid_df, tokenizer=tokenizer)
-    train_loader, valid_loader = DataLoader(
-        train_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False
-    ), DataLoader(valid_dataset, batch_size=cfg.BATCH_SIZE, shuffle=False)
-
-    model = run_training(train_dataloader=train_loader, valid_dataloader=valid_loader)
+            torch.save(model.state_dict(), 'best_model_ner.pt')
+        
+            run.summary['BEST_EPOCH'] = epoch
+            run.summary['BEST_TRAIN_LOSS'] = train_loss
+            run.summary['BEST_VALID_LOSS'] = valid_loss
+        
+        wandb.log({
+            'train/loss': train_loss,
+            'valid/loss': valid_loss
+        })
+    
+    print(f"\t\t\t\t\t>>>>>>>> MODEL TRAINING DONE <<<<<<<<<")

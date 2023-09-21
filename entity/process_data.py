@@ -12,9 +12,9 @@ from tqdm import tqdm
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument(
-        "--src", type=str, default="../data/ner/NER_TRAIN/NER_TRAIN_JUDGEMENT.json"
+        "--src", type=str, default="../data/ner/NER_TRAIN"
     )
-    parser.add_argument("--dst", type=str, default="../data/ner/ner_train.csv")
+    parser.add_argument("--dst", type=str, default="../data/ner/ner_valid.csv")
     args = parser.parse_args()
     return args
 

@@ -160,4 +160,13 @@ cython_debug/
 #.idea/
 
 data/
+<<<<<<< HEAD
 wandb/
+=======
+
+classifier/BART_base_tkn1028_models
+**model**
+
+models/
+wandb/
+>>>>>>> 8d5b116fcd74c2c6a6fef52691efb69599455993

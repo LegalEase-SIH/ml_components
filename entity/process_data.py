@@ -12,9 +12,9 @@ from tqdm import tqdm
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument(
-        "--src", type=str, default="../data/ner/NER_TRAIN"
+        "--src", type=str, default="../data/ner/NER_TRAIN/NER_TRAIN_PREAMBLE.json"
     )
-    parser.add_argument("--dst", type=str, default="../data/ner/ner_valid.csv")
+    parser.add_argument("--dst", type=str, default="../data/ner/ner_preamble_train.csv")
     args = parser.parse_args()
     return args
 
@@ -89,6 +89,7 @@ class Preprocessor(object):
                     self.df["tag"].append("OBJECT")
 
         self.df = pd.DataFrame(self.df)
+        self.df['words'] = self.df['words'].apply(lambda x: x.strip())
         self.df.to_csv(self.args.dst, index=False)
 
         print(

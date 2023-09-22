@@ -24,4 +24,4 @@ RUN pip install -r requirements.txt
 RUN pip install pip install https://huggingface.co/opennyaiorg/en_legal_ner_trf/resolve/main/en_legal_ner_trf-any-py3-none-any.whl
 
 
-CMD [ "uvicorn", "main:app", "--reload", "--host", "0.0.0.0", "--port", "8080"]
+CMD [ "uvicorn", "api.main:app", "--reload", "--host", "0.0.0.0", "--port", "8080"]

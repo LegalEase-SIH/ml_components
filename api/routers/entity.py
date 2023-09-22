@@ -28,6 +28,6 @@ def get_entities(request: EntityRequest):
     res = defaultdict(list)
 
     for ent in doc.ents:
-        res[ent].append(ent.label_)
+        res[ent.label_].append(ent)
 
     return EntityResponse(entitities=res)

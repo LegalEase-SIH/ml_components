@@ -1,17 +1,33 @@
-import copy
-from typing import List
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
-import pinecone
-from sentence_transformers import SentenceTransformer
+from collections import defaultdict
+from typing import Dict, List
+from pydantic import BaseModel
+import spacy
+import os
 
-from api.config import get_settings
-from api.schema import EntitySchema
+# os.system(command="!pip install https://huggingface.co/opennyaiorg/en_legal_ner_trf/resolve/main/en_legal_ner_trf-any-py3-none-any.whl")
+
+nlp = spacy.load("en_legal_ner_trf")
+
+router = APIRouter()
 
 
-settings = get_settings()
+class EntityRequest(BaseModel):
+    raw_text: str
 
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
-pinecone.init(api_key=settings.PINECONE_API_KEY, environment=settings.PINECONE_ENVIRONMENT)
-index = pinecone.Index(settings.PINECONE_INDEX)
+class EntityResponse(BaseModel):
+    entitities: Dict[str, List[str]]
+
+
+@router.post("/", response_model=EntityResponse)
+def get_entities(request: EntityRequest):
+    raw_text = request.raw_text
+    doc = nlp(raw_text)
+
+    res = defaultdict(list)
+
+    for ent in doc.ents:
+        res[ent].append(ent.label_)
+
+    return EntityResponse(entitities=res)

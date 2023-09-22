@@ -1,0 +1,7 @@
+.vscode/
+classifier/
+data/
+entity/
+models/
+search/
+venv/
